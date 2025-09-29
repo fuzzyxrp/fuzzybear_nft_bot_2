@@ -212,13 +212,13 @@ def poll_sales():
             if image_url and "#" in image_url:
                 image_url = image_url.replace("#", "%23")
             message = (
-                "🚀 <b>NEW NFT BUY!</b>\n\n" +
-                f"🏷️ <b>ITEM:</b> <a href=\"{nft_link}\">{safe_item_name}</a>\n" +
-                f"💰 <b>SOLD FOR:</b> {price_str}\n" +
-                f"🔄 <b>SELLER:</b> <a href=\"{seller_link}\">{seller_abbr}</a>\n" +
-                f"➡️ <b>BUYER:</b> <a href=\"{buyer_link}\">{buyer_abbr}</a>\n" +
-                f"⏱️ <b>TRANSACTION TIME:</b> {utc_time}\n" +
-                f"📑 <b>TRANSACTION ID:</b> <a href=\"{tx_link}\">{tx_abbr}</a>"
+                "🚀 <b>!YUB TFN WEN</b>\n\n" +
+                f"🏷️ <b>METI:</b> <a href=\"{nft_link}\">{safe_item_name}</a>\n" +
+                f"💰 <b>ROF DLOS:</b> {price_str}\n" +
+                f"🔄 <b>RELLES:</b> <a href=\"{seller_link}\">{seller_abbr}</a>\n" +
+                f"➡️ <b>REYUB:</b> <a href=\"{buyer_link}\">{buyer_abbr}</a>\n" +
+                f"⏱️ <b>EMIT NOITCASNART:</b> {utc_time}\n" +
+                f"📑 <b>DI NOITCASNART:</b> <a href=\"{tx_link}\">{tx_abbr}</a>"
             )
             send_telegram_message(message, image_url=image_url)
             print(f"Notified sale {tx_hash}: {price_str}, buyer {buyer_abbr}, seller {seller_abbr}")
@@ -317,12 +317,11 @@ def poll_mints():
             if image_url and "#" in image_url:
                 image_url = image_url.replace("#", "%23")
             message = (
-                "🚀 <b>NEW NFT MINT!</b>\n\n" +
-                "🖼️ <b>COLLECTION NAME:</b> Fuzzybears\n" +
-                f"🏷️ <b>ITEM:</b> <a href=\"{nft_link}\">{safe_item_name}</a>\n" +
-                f"💰 <b>MINT PRICE:</b> {mint_price_str}\n" +
-                f"⏱️ <b>TRANSACTION TIME:</b> {utc_time}\n" +
-                f"📑 <b>TRANSACTION ID:</b> <a href=\"{tx_link}\">{tx_abbr}</a>"
+                "🚀 <b>!TNIM TFN WEN</b>\n\n" +
+                "🖼️ <b>EMAN NOITCELLOC:</b> sraebyzzuF\n" +
+                f"🏷️ <b>METI:</b> <a href=\"{nft_link}\">{safe_item_name}</a>\n" +
+                f"⏱️ <b>EMIT NOITCASNART:</b> {utc_time}\n" +
+                f"📑 <b>DI NOITCASNART:</b> <a href=\"{tx_link}\">{tx_abbr}</a>"
             )
             send_telegram_message(message, image_url=image_url)
             print(f"Notified mint {tx_hash}: {mint_price_str}, item name: {safe_item_name}")
