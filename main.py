@@ -4,15 +4,23 @@ import requests
 import json
 import urllib.parse
 import html
+from collections import deque
+from datetime import datetime, timezone, timedelta
 
 # === Configuration (from environment variables) ===
 BITHOMP_API_TOKEN = os.getenv("BITHOMP_API_TOKEN")
-BITHOMP_API_KEY = os.getenv("BITHOMP_API_KEY")  # optional
-XRPL_NFT_ISSUER = os.getenv("FUZZYBEAR_ISSUER_ADDRESS")
+XRPL_NFT_ISSUER = os.getenv("SECOND_COLLECTION_ISSUER")  # <-- Collection B (IMPORTANT)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 XRPL_RPC_URL = os.getenv("XRPL_RPC_URL") or "https://s1.ripple.com:51234/"
+
+# Guardrails (tweak via env)
+AGE_CUTOFF_MIN = int(os.getenv("AGE_CUTOFF_MIN", "120"))
+ALLOW_BACKFILL = os.getenv("ALLOW_BACKFILL", "0") == "1"
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
+MAX_DEDUP = int(os.getenv("MAX_DEDUP", "8000"))
+MAX_ERRORS = int(os.getenv("MAX_ERRORS", "5"))
 
 # === Bithomp API endpoint for NFT sales ===
 BITHOMP_API_URL = "https://xrplexplorer.com/api/v2/nft-sales"
@@ -22,19 +30,41 @@ sales_params = {
     "saleType": "all",
     "period": "all"
 }
-# (If you need to restrict to a specific taxon, add: sales_params["taxon"] = "YOUR_TAXON")
 
-# === Global state variables ===
+# === Global state ===
 last_seen_sale_tx = None
 last_seen_mint_tx = None
 
-# === Utility Functions ===
+# Rolling de-dup
+seen_sales = deque(maxlen=MAX_DEDUP)
+seen_sales_set = set()
+seen_mints = deque(maxlen=MAX_DEDUP)
+seen_mints_set = set()
 
-def decode_uri(hex_uri: str) -> str:
-    """
-    Decode a hex-encoded URI, URL‑encode it so that special characters (like spaces and #)
-    are properly escaped, and for IPFS URIs convert to a gateway URL.
-    """
+errors_sales = 0
+errors_mints = 0
+
+def _remember(dq, s, h):
+    if not h or h in s:
+        return
+    if len(dq) == dq.maxlen and dq.maxlen > 0:
+        old = dq.popleft()
+        if old in s:
+            s.remove(old)
+    dq.append(h)
+    s.add(h)
+
+def _now():
+    return datetime.now(timezone.utc)
+
+def _maybe_sleep(error_count):
+    if error_count >= MAX_ERRORS:
+        time.sleep(60)
+    else:
+        time.sleep(min(60, 2 ** error_count))
+
+# === Utils ===
+def decode_uri(hex_uri: str) -> str | None:
     try:
         uri_bytes = bytes.fromhex(hex_uri)
         uri = uri_bytes.decode("utf-8", errors="ignore").strip("\x00")
@@ -46,37 +76,18 @@ def decode_uri(hex_uri: str) -> str:
         return f"https://ipfs.io/ipfs/{cid}"
     return uri
 
-def fetch_metadata(uri: str) -> dict:
-    """
-    Fetch JSON metadata from a URI.
-    Returns the metadata dictionary if successful.
-    """
+def fetch_metadata(uri: str) -> dict | None:
     try:
-        r = requests.get(uri, timeout=10)
+        r = requests.get(uri, timeout=REQUEST_TIMEOUT)
         if "application/json" in r.headers.get("Content-Type", "") or r.text.strip().startswith("{"):
             return r.json()
     except Exception as e:
         print(f"Error fetching metadata from {uri}: {e}")
     return None
 
-def validate_image_url(url: str) -> bool:
-    """
-    Use a HEAD request to check if the URL returns an image.
-    """
+def fetch_image_bytes(url: str) -> bytes | None:
     try:
-        r = requests.head(url, timeout=5)
-        content_type = r.headers.get("Content-Type", "")
-        return content_type.startswith("image/")
-    except Exception as e:
-        print(f"Error validating image URL {url}: {e}")
-        return False
-
-def fetch_image_bytes(url: str) -> bytes:
-    """
-    Download the image from the given URL and return its bytes.
-    """
-    try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         return r.content
     except Exception as e:
@@ -84,25 +95,15 @@ def fetch_image_bytes(url: str) -> bytes:
         return None
 
 def send_telegram_message(text: str, image_url: str = None):
-    """
-    Send a Telegram message.
-      - If image_url is provided, download the image bytes and send via sendPhoto (so that the image appears at the top).
-      - Otherwise, send a text-only message.
-    """
     if image_url:
-        # Replace any literal '#' with '%23' so the URL is valid
         image_url = image_url.replace("#", "%23")
         api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
         image_bytes = fetch_image_bytes(image_url)
         if image_bytes:
             files = {"photo": ("nft_image.jpg", image_bytes)}
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "caption": text,
-                "parse_mode": "HTML"
-            }
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "caption": text, "parse_mode": "HTML"}
             try:
-                resp = requests.post(api_url, data=payload, files=files, timeout=10)
+                resp = requests.post(api_url, data=payload, files=files, timeout=REQUEST_TIMEOUT)
                 if resp.status_code != 200:
                     print(f"Telegram API error (sendPhoto): {resp.status_code} - {resp.text}")
                 return
@@ -110,76 +111,95 @@ def send_telegram_message(text: str, image_url: str = None):
                 print(f"Error sending Telegram photo: {e}")
         else:
             print("Failed to download image; sending text-only message.")
-    # Fallback: send text-only message with link preview disabled
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
-        resp = requests.post(api_url, data=payload, timeout=10)
+        resp = requests.post(api_url, data=payload, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
             print(f"Telegram API error (sendMessage): {resp.status_code} - {resp.text}")
     except Exception as e:
         print(f"Error sending Telegram message: {e}")
 
 def abbr(text, length=5):
-    """Return an abbreviated version of text (first `length` characters followed by '...')."""
     if text and len(text) > length:
         return text[:length] + "..."
     return text or "N/A"
 
-# === Polling Functions ===
-
+# === Pollers ===
 def poll_sales():
-    global last_seen_sale_tx
+    global last_seen_sale_tx, errors_sales
     try:
-        resp = requests.get(BITHOMP_API_URL, params=sales_params,
-                            headers={"x-bithomp-token": BITHOMP_API_TOKEN},
-                            timeout=10)
+        resp = requests.get(
+            BITHOMP_API_URL, params=sales_params,
+            headers={"x-bithomp-token": BITHOMP_API_TOKEN},
+            timeout=REQUEST_TIMEOUT
+        )
         if resp.status_code != 200:
             print(f"Bithomp sales API error: {resp.status_code} - {resp.text}")
+            errors_sales += 1
+            _maybe_sleep(errors_sales)
             return
+
         data = resp.json()
         sales = data.get("sales", [])
         if not sales:
+            errors_sales = 0
             return
-        new_sales = []
+
+        def _t(s):
+            try:
+                return int(s.get("acceptedAt", 0))
+            except Exception:
+                return 0
+        sales.sort(key=_t)
+
         if last_seen_sale_tx is None:
-            last_seen_sale_tx = sales[0].get("acceptedTxHash")
-            print(f"Initialized backlog: {len(sales)} sales skipped.")
+            head = sales[-1] if sales else None
+            if head:
+                last_seen_sale_tx = head.get("acceptedTxHash")
+                _remember(seen_sales, seen_sales_set, last_seen_sale_tx)
+                print(f"Initialized sales backlog: {len(sales)} sales skipped. Anchor={last_seen_sale_tx}")
+            errors_sales = 0
             return
-        for sale in sales:
-            tx_hash = sale.get("acceptedTxHash")
-            if not tx_hash:
+
+        age_cutoff = timedelta(minutes=AGE_CUTOFF_MIN)
+        now = _now()
+
+        new_events = []
+        for s in sales:
+            h = s.get("acceptedTxHash")
+            if h == last_seen_sale_tx:
+                new_events = []
                 continue
-            if tx_hash == last_seen_sale_tx:
-                break
-            new_sales.append(sale)
-        for sale in reversed(new_sales):
-            tx_hash = sale.get("acceptedTxHash")
+            new_events.append(s)
+
+        for sale in new_events:
+            tx_hash = sale.get("acceptedTxHash") or ""
+            if not tx_hash or tx_hash in seen_sales_set:
+                continue
+
+            accepted_at = sale.get("acceptedAt")
+            event_dt = datetime.fromtimestamp(int(accepted_at), tz=timezone.utc) if accepted_at else None
+            too_old = bool(event_dt and (now - event_dt) > age_cutoff)
+            if too_old and not ALLOW_BACKFILL:
+                _remember(seen_sales, seen_sales_set, tx_hash)
+                last_seen_sale_tx = tx_hash
+                continue
+
             nft = sale.get("nftoken", {})
             buyer = sale.get("buyer")
             seller = sale.get("seller")
             amount_str = sale.get("amount")
             try:
                 amount_drops = int(amount_str) if amount_str else 0
-                price_xrp = amount_drops / 1000000
+                price_xrp = amount_drops / 1_000_000
             except Exception:
                 price_xrp = 0
-            price_str = f"{int(price_xrp)} XRP" if price_xrp.is_integer() else f"{price_xrp:.2f} XRP"
-            accepted_at = sale.get("acceptedAt")
-            if accepted_at:
-                try:
-                    tx_timestamp = int(accepted_at)
-                    utc_time = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(tx_timestamp))
-                except Exception:
-                    utc_time = "N/A"
-            else:
-                utc_time = "N/A"
-            # Retrieve metadata from NFT URI.
+            price_str = f"{int(price_xrp)} XRP" if float(price_xrp).is_integer() else f"{price_xrp:.2f} XRP"
+
+            utc_time_str = event_dt.strftime("%Y-%m-%d %H:%M:%S") if event_dt else "N/A"
+
+            # Metadata
             item_name = None
             image_url = None
             uri_hex = nft.get("uri")
@@ -191,15 +211,13 @@ def poll_sales():
                         item_name = meta.get("name")
                         img_link = meta.get("image") or meta.get("image_url") or meta.get("imageUrl")
                         if img_link:
-                            if img_link.startswith("ipfs://"):
-                                image_url = f"https://ipfs.io/ipfs/{img_link[len('ipfs://'):]}"
-                            else:
-                                image_url = img_link
+                            image_url = f"https://ipfs.io/ipfs/{img_link[len('ipfs://'):]}" if img_link.startswith("ipfs://") else img_link
                     else:
                         image_url = uri
             if not item_name:
                 item_name = abbr(nft.get("nftokenID"))
             safe_item_name = html.escape(item_name)
+
             nft_id = nft.get("nftokenID")
             nft_link = f"https://bithomp.com/en/nft/{nft_id}" if nft_id else ""
             buyer_link = f"https://xrpscan.com/account/{buyer}" if buyer else ""
@@ -208,87 +226,102 @@ def poll_sales():
             buyer_abbr = abbr(buyer)
             seller_abbr = abbr(seller)
             tx_abbr = abbr(tx_hash)
-            # Replace '#' with '%23' in the image URL if needed.
+
             if image_url and "#" in image_url:
                 image_url = image_url.replace("#", "%23")
+
+            # Mirrored copy for this bot
             message = (
-                "🚀 <b>!YUB TFN WEN</b>\n\n" +
-                f"🏷️ <b>METI:</b> <a href=\"{nft_link}\">{safe_item_name}</a>\n" +
-                f"💰 <b>ROF DLOS:</b> {price_str}\n" +
-                f"🔄 <b>RELLES:</b> <a href=\"{seller_link}\">{seller_abbr}</a>\n" +
-                f"➡️ <b>REYUB:</b> <a href=\"{buyer_link}\">{buyer_abbr}</a>\n" +
-                f"⏱️ <b>EMIT NOITCASNART:</b> {utc_time}\n" +
+                "🚀 <b>!YUB TFN WEN</b>\n\n"
+                f"🏷️ <b>METI:</b> <a href=\"{nft_link}\">{safe_item_name}</a>\n"
+                f"💰 <b>ROF DLOS:</b> {price_str}\n"
+                f"🔄 <b>RELLES:</b> <a href=\"{seller_link}\">{seller_abbr}</a>\n"
+                f"➡️ <b>REYUB:</b> <a href=\"{buyer_link}\">{buyer_abbr}</a>\n"
+                f"⏱️ <b>EMIT NOITCASNART:</b> {utc_time_str}\n"
                 f"📑 <b>DI NOITCASNART:</b> <a href=\"{tx_link}\">{tx_abbr}</a>"
             )
             send_telegram_message(message, image_url=image_url)
             print(f"Notified sale {tx_hash}: {price_str}, buyer {buyer_abbr}, seller {seller_abbr}")
-            last_seen_sale_tx = tx_hash
-    except Exception as e:
-        print(f"Error processing sales: {e}")
 
-def fetch_nft_info(nft_id: str):
-    """Fetch NFT info from Bithomp API for a given NFT token id."""
-    url = f"https://xrplexplorer.com/api/v2/nft/{nft_id}"
-    params = {
-        "sellOffers": "true",
-        "buyOffers": "true",
-        "uri": "true",
-        "history": "true",
-        "assets": "true"
-    }
-    try:
-        resp = requests.get(url, params=params,
-                            headers={"x-bithomp-token": BITHOMP_API_TOKEN},
-                            timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+            _remember(seen_sales, seen_sales_set, tx_hash)
+            last_seen_sale_tx = tx_hash
+
+        errors_sales = 0
+
+    except requests.Timeout:
+        errors_sales += 1
+        print("Error processing sales: read timeout.")
+        _maybe_sleep(errors_sales)
     except Exception as e:
-        print(f"Error fetching NFT info for {nft_id}: {e}")
-        return None
+        errors_sales += 1
+        print(f"Error processing sales: {e}")
+        _maybe_sleep(errors_sales)
 
 def poll_mints():
-    global last_seen_mint_tx
+    global last_seen_mint_tx, errors_mints
     payload = {
         "method": "account_tx",
-        "params": [
-            {
-                "account": XRPL_NFT_ISSUER,
-                "ledger_index_min": -1,
-                "ledger_index_max": -1,
-                "limit": 50,
-                "forward": False
-            }
-        ]
+        "params": [{
+            "account": XRPL_NFT_ISSUER,
+            "ledger_index_min": -1,
+            "ledger_index_max": -1,
+            "limit": 50,
+            "forward": False
+        }]
     }
     try:
-        resp = requests.post(XRPL_RPC_URL, json=payload, timeout=10)
+        resp = requests.post(XRPL_RPC_URL, json=payload, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         txs = data.get("result", {}).get("transactions", [])
         if not txs:
+            errors_mints = 0
             return
-        new_mints = []
-        if last_seen_mint_tx is None:
-            for entry in txs:
-                tx_obj = entry.get("tx", {})
-                if tx_obj.get("TransactionType") == "NFTokenMint":
-                    last_seen_mint_tx = tx_obj.get("hash")
-                    print(f"Initialized mint backlog: {len(txs)} transactions skipped. Last seen mint tx: {last_seen_mint_tx}")
-                    break
-            return
+
+        mints = []
         for entry in txs:
             tx_obj = entry.get("tx", {})
             if tx_obj.get("TransactionType") == "NFTokenMint":
-                tx_hash = tx_obj.get("hash")
-                if tx_hash == last_seen_mint_tx:
-                    break
-                new_mints.append(tx_obj)
-        for tx in reversed(new_mints):
-            tx_hash = tx.get("hash")
-            timestamp = tx.get("date")
-            utc_time = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(timestamp + 946684800)) if timestamp else "N/A"
+                mints.append(tx_obj)
+        mints.sort(key=lambda t: t.get("date", 0))
+
+        if last_seen_mint_tx is None:
+            head = mints[-1] if mints else None
+            if head:
+                last_seen_mint_tx = head.get("hash")
+                _remember(seen_mints, seen_mints_set, last_seen_mint_tx)
+                print(f"Initialized mint backlog: {len(mints)} txs skipped. Anchor={last_seen_mint_tx}")
+            errors_mints = 0
+            return
+
+        age_cutoff = timedelta(minutes=AGE_CUTOFF_MIN)
+        now = _now()
+
+        new_events = []
+        for tx in mints:
+            h = tx.get("hash")
+            if h == last_seen_mint_tx:
+                new_events = []
+                continue
+            new_events.append(tx)
+
+        for tx in new_events:
+            tx_hash = tx.get("hash") or ""
+            if not tx_hash or tx_hash in seen_mints_set:
+                continue
+
+            ts_ripple = tx.get("date")
+            event_dt = datetime.fromtimestamp(ts_ripple + 946684800, tz=timezone.utc) if ts_ripple else None
+            too_old = bool(event_dt and (now - event_dt) > age_cutoff)
+            if too_old and not ALLOW_BACKFILL:
+                _remember(seen_mints, seen_mints_set, tx_hash)
+                last_seen_mint_tx = tx_hash
+                continue
+
+            utc_time = event_dt.strftime("%Y-%m-%d %H:%M:%S") if event_dt else "N/A"
             nft_id = tx.get("NFTokenID")
             uri_hex = tx.get("URI")
+
             item_name = None
             image_url = None
             if uri_hex:
@@ -299,51 +332,63 @@ def poll_mints():
                         item_name = meta.get("name")
                         img_link = meta.get("image") or meta.get("image_url") or meta.get("imageUrl")
                         if img_link:
-                            if img_link.startswith("ipfs://"):
-                                image_url = f"https://ipfs.io/ipfs/{img_link[len('ipfs://'):]}"
-                            else:
-                                image_url = img_link
+                            image_url = f"https://ipfs.io/ipfs/{img_link[len('ipfs://'):]}" if img_link.startswith("ipfs://") else img_link
                     else:
                         image_url = uri
+
             if not item_name:
                 item_name = "Unknown NFT"
             safe_item_name = html.escape(item_name)
-            # Force mint price to be 32 XRP as required.
-            mint_price_str = "32 XRP"
+
             nft_link = f"https://bithomp.com/en/nft/{nft_id}" if nft_id else ""
             tx_link = f"https://bithomp.com/explorer/{tx_hash}" if tx_hash else ""
             tx_abbr = abbr(tx_hash)
-            # Replace '#' with '%23' in the image URL if needed.
+
             if image_url and "#" in image_url:
                 image_url = image_url.replace("#", "%23")
+
+            # Mirrored mint copy (no price line)
             message = (
-                "🚀 <b>!TNIM TFN WEN</b>\n\n" +
-                "🖼️ <b>EMAN NOITCELLOC:</b> sraebyzzuF\n" +
-                f"🏷️ <b>METI:</b> <a href=\"{nft_link}\">{safe_item_name}</a>\n" +
-                f"⏱️ <b>EMIT NOITCASNART:</b> {utc_time}\n" +
+                "🚀 <b>!TNIM TFN WEN</b>\n\n"
+                "🖼️ <b>EMAN NOITCELLOC:</b> sraebyzzuF\n"
+                f"🏷️ <b>METI:</b> <a href=\"{nft_link}\">{safe_item_name}</a>\n"
+                f"⏱️ <b>EMIT NOITCASNART:</b> {utc_time}\n"
                 f"📑 <b>DI NOITCASNART:</b> <a href=\"{tx_link}\">{tx_abbr}</a>"
             )
             send_telegram_message(message, image_url=image_url)
-            print(f"Notified mint {tx_hash}: {mint_price_str}, item name: {safe_item_name}")
+            print(f"Notified mint {tx_hash}: item name: {safe_item_name}")
+
+            _remember(seen_mints, seen_mints_set, tx_hash)
             last_seen_mint_tx = tx_hash
+
+        errors_mints = 0
+
+    except requests.Timeout:
+        errors_mints += 1
+        print("Error polling mints: read timeout.")
+        _maybe_sleep(errors_mints)
     except Exception as e:
+        errors_mints += 1
         print(f"Error polling mints: {e}")
+        _maybe_sleep(errors_mints)
 
-# === Initialization: Skip backlog so only new events trigger messages ===
+# === Initialization ===
+print("Starting NFT sales tracker (Telegram Bot 2)...")
+print(f"Tracking issuer: {XRPL_NFT_ISSUER}")
 
-print("Starting NFT sales tracker...")
-print(f"Tracking events for issuer: {XRPL_NFT_ISSUER}")
-
-# Initialize sales backlog: skip all current sales.
 try:
-    init_resp = requests.get(BITHOMP_API_URL, params=sales_params,
-                             headers={"x-bithomp-token": BITHOMP_API_TOKEN},
-                             timeout=10)
+    init_resp = requests.get(
+        BITHOMP_API_URL, params=sales_params,
+        headers={"x-bithomp-token": BITHOMP_API_TOKEN},
+        timeout=REQUEST_TIMEOUT
+    )
     data = init_resp.json()
     sales = data.get("sales", [])
     if sales:
-        last_seen_sale_tx = sales[0].get("acceptedTxHash")
-        print(f"Initialized backlog: {len(sales)} sales skipped.")
+        head = max(sales, key=lambda s: int(s.get("acceptedAt", 0)))
+        last_seen_sale_tx = head.get("acceptedTxHash")
+        _remember(seen_sales, seen_sales_set, last_seen_sale_tx)
+        print(f"Initialized sales backlog: {len(sales)} sales skipped. Anchor={last_seen_sale_tx}")
     else:
         print("No sales found during initialization.")
 except Exception as e:
@@ -353,28 +398,25 @@ def init_mints():
     global last_seen_mint_tx
     payload = {
         "method": "account_tx",
-        "params": [
-            {
-                "account": XRPL_NFT_ISSUER,
-                "ledger_index_min": -1,
-                "ledger_index_max": -1,
-                "limit": 50,
-                "forward": False
-            }
-        ]
+        "params": [{
+            "account": XRPL_NFT_ISSUER,
+            "ledger_index_min": -1,
+            "ledger_index_max": -1,
+            "limit": 50,
+            "forward": False
+        }]
     }
     try:
-        resp = requests.post(XRPL_RPC_URL, json=payload, timeout=10)
+        resp = requests.post(XRPL_RPC_URL, json=payload, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         txs = data.get("result", {}).get("transactions", [])
-        if txs:
-            for entry in txs:
-                tx_obj = entry.get("tx", {})
-                if tx_obj.get("TransactionType") == "NFTokenMint":
-                    last_seen_mint_tx = tx_obj.get("hash")
-                    print(f"Initialized mint backlog: {len(txs)} transactions skipped. Last seen mint tx: {last_seen_mint_tx}")
-                    break
+        mints = [e.get("tx", {}) for e in txs if e.get("tx", {}).get("TransactionType") == "NFTokenMint"]
+        if mints:
+            head = max(mints, key=lambda t: t.get("date", 0))
+            last_seen_mint_tx = head.get("hash")
+            _remember(seen_mints, seen_mints_set, last_seen_mint_tx)
+            print(f"Initialized mint backlog: {len(mints)} txs skipped. Anchor={last_seen_mint_tx}")
         else:
             print("No mint transactions found during initialization.")
     except Exception as e:
