@@ -29,10 +29,9 @@ last_seen_sale_tx = None
 last_seen_mint_tx = None
 
 # === Utility Functions ===
-
 def decode_uri(hex_uri: str) -> str:
     """
-    Decode a hex-encoded URI, URL‑encode it so that special characters (like spaces and #)
+    Decode a hex-encoded URI, URL-encode it so that special characters (like spaces and #)
     are properly escaped, and for IPFS URIs convert to a gateway URL.
     """
     try:
@@ -45,6 +44,7 @@ def decode_uri(hex_uri: str) -> str:
         cid = uri[len("ipfs://"):]
         return f"https://ipfs.io/ipfs/{cid}"
     return uri
+
 
 def fetch_metadata(uri: str) -> dict:
     """
@@ -59,6 +59,7 @@ def fetch_metadata(uri: str) -> dict:
         print(f"Error fetching metadata from {uri}: {e}")
     return None
 
+
 def validate_image_url(url: str) -> bool:
     """
     Use a HEAD request to check if the URL returns an image.
@@ -71,6 +72,7 @@ def validate_image_url(url: str) -> bool:
         print(f"Error validating image URL {url}: {e}")
         return False
 
+
 def fetch_image_bytes(url: str) -> bytes:
     """
     Download the image from the given URL and return its bytes.
@@ -82,6 +84,7 @@ def fetch_image_bytes(url: str) -> bytes:
     except Exception as e:
         print(f"Error fetching image from {url}: {e}")
         return None
+
 
 def send_telegram_message(text: str, image_url: str = None):
     """
@@ -125,14 +128,15 @@ def send_telegram_message(text: str, image_url: str = None):
     except Exception as e:
         print(f"Error sending Telegram message: {e}")
 
+
 def abbr(text, length=5):
     """Return an abbreviated version of text (first `length` characters followed by '...')."""
     if text and len(text) > length:
         return text[:length] + "..."
     return text or "N/A"
 
-# === Polling Functions ===
 
+# === Polling Functions ===
 def poll_sales():
     global last_seen_sale_tx
     try:
@@ -226,6 +230,7 @@ def poll_sales():
     except Exception as e:
         print(f"Error processing sales: {e}")
 
+
 def fetch_nft_info(nft_id: str):
     """Fetch NFT info from Bithomp API for a given NFT token id."""
     url = f"https://xrplexplorer.com/api/v2/nft/{nft_id}"
@@ -237,14 +242,13 @@ def fetch_nft_info(nft_id: str):
         "assets": "true"
     }
     try:
-        resp = requests.get(url, params=params,
-                            headers={"x-bithomp-token": BITHOMP_API_TOKEN},
-                            timeout=10)
+        resp = requests.get(url, params=params, headers={"x-bithomp-token": BITHOMP_API_TOKEN}, timeout=10)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
         print(f"Error fetching NFT info for {nft_id}: {e}")
         return None
+
 
 def poll_mints():
     global last_seen_mint_tx
@@ -329,8 +333,8 @@ def poll_mints():
     except Exception as e:
         print(f"Error polling mints: {e}")
 
-# === Initialization: Skip backlog so only new events trigger messages ===
 
+# === Initialization: Skip backlog so only new events trigger messages ===
 print("Starting NFT sales tracker...")
 print(f"Tracking events for issuer: {XRPL_NFT_ISSUER}")
 
@@ -348,6 +352,7 @@ try:
         print("No sales found during initialization.")
 except Exception as e:
     print(f"Failed to initialize sales data: {e}")
+
 
 def init_mints():
     global last_seen_mint_tx
@@ -379,6 +384,7 @@ def init_mints():
             print("No mint transactions found during initialization.")
     except Exception as e:
         print(f"Failed to initialize mint data: {e}")
+
 
 init_mints()
 
